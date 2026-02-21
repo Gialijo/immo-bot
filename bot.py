@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import tempfile
 from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
@@ -9,9 +10,14 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from openai import OpenAI
 
 # --- Configuration ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
+
+# Client OpenAI pour la transcription
+openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # On garde en mémoire les infos collectées pour chaque conversation
 conversations = {}
@@ -87,6 +93,26 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# --- Fonction de transcription ---
+
+async def transcrire_audio(file_path: str) -> str:
+    """Transcrit un fichier audio en texte avec Whisper"""
+    if not openai_client:
+        return "❌ Erreur : clé OpenAI non configurée."
+
+    try:
+        with open(file_path, "rb") as audio_file:
+            transcription = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                language="fr",
+            )
+        return transcription.text
+    except Exception as e:
+        logger.error(f"Erreur transcription: {e}")
+        return f"❌ Erreur lors de la transcription : {e}"
+
+
 # --- Commandes du bot ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -96,15 +122,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "👋 Salut ! Je suis ton assistant immobilier.\n\n"
-        "Envoie-moi les infos du bien que tu visites, comme si tu parlais à un collègue. "
-        "Par exemple :\n\n"
-        "💬 « C'est un T3 de 65m² au 2ème étage, rue de la Paix à Lyon. "
+        "Envoie-moi les infos du bien que tu visites, comme si tu parlais à un collègue.\n\n"
+        "Tu peux m'envoyer :\n"
+        "💬 Des messages écrits\n"
+        "🎤 Des notes vocales\n\n"
+        "Par exemple, dis-moi ou écris-moi :\n"
+        "« C'est un T3 de 65m² au 2ème étage, rue de la Paix à Lyon. "
         "Prix vendeur 280k. Bon état général, DPE D. "
         "Il y a un balcon et une cave. Charges 150€/mois. »\n\n"
         "Tu peux m'envoyer les infos en plusieurs messages, petit à petit.\n\n"
-        "📋 Tape /fiche pour voir la fiche en cours\n"
-        "🗑️ Tape /reset pour recommencer une nouvelle fiche\n"
-        "❓ Tape /manque pour voir les champs qu'il reste à remplir"
+        "📋 /fiche → voir la fiche en cours\n"
+        "❓ /manque → voir les champs à remplir\n"
+        "🗑️ /reset → recommencer une nouvelle fiche"
     )
 
 
@@ -120,7 +149,6 @@ async def voir_fiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Construire le résumé des champs remplis
     lignes = ["📋 *FICHE DU BIEN EN COURS*\n"]
     remplis = 0
     total = len(fiche)
@@ -188,12 +216,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     texte = update.message.text
 
-    # Créer une fiche si elle n'existe pas encore
     if user_id not in conversations:
         conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
 
-    # Pour l'instant, on confirme la réception
-    # (Dans la Brique 4, c'est ici que l'IA analysera le message)
     fiche = conversations[user_id]
     remplis = sum(1 for v in fiche.values() if v is not None)
     total = len(fiche)
@@ -208,6 +233,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reçoit les notes vocales et les transcrit"""
+    user_id = update.effective_user.id
+
+    if user_id not in conversations:
+        conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+
+    # Envoyer un message "en cours de traitement"
+    processing_msg = await update.message.reply_text("🎤 Je transcris ta note vocale...")
+
+    try:
+        # Récupérer le fichier audio depuis Telegram
+        voice = update.message.voice
+        voice_file = await context.bot.get_file(voice.file_id)
+
+        # Télécharger dans un fichier temporaire
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            await voice_file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+
+        # Transcrire avec Whisper
+        texte = await transcrire_audio(tmp_path)
+
+        # Supprimer le fichier temporaire
+        os.unlink(tmp_path)
+
+        if texte.startswith("❌"):
+            await processing_msg.edit_text(texte)
+            return
+
+        # Afficher la transcription
+        fiche = conversations[user_id]
+        remplis = sum(1 for v in fiche.values() if v is not None)
+        total = len(fiche)
+
+        duree = voice.duration
+        await processing_msg.edit_text(
+            f"🎤 *Note vocale transcrite !* ({duree}s)\n\n"
+            f"📝 Texte : « {texte} »\n\n"
+            f"📋 Fiche : {remplis}/{total} champs remplis\n\n"
+            f"💡 _Dans la prochaine version, je comprendrai automatiquement "
+            f"les infos et remplirai la fiche tout seul !_",
+            parse_mode="Markdown",
+        )
+
+        logger.info(f"Transcription réussie ({duree}s): {texte[:100]}")
+
+    except Exception as e:
+        logger.error(f"Erreur traitement vocal: {e}")
+        await processing_msg.edit_text(
+            f"❌ Erreur lors du traitement de la note vocale.\n"
+            f"Détail : {e}"
+        )
+
+
 # --- Démarrage du bot ---
 
 def main():
@@ -215,6 +295,10 @@ def main():
         print("❌ ERREUR: La variable TELEGRAM_BOT_TOKEN n'est pas définie !")
         print("   Ajoute-la dans les variables d'environnement de Railway.")
         return
+
+    if not OPENAI_KEY:
+        print("⚠️ ATTENTION: La variable OPENAI_API_KEY n'est pas définie !")
+        print("   Les notes vocales ne fonctionneront pas sans cette clé.")
 
     print("🚀 Démarrage du bot...")
 
@@ -228,6 +312,9 @@ def main():
 
     # Messages texte
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Notes vocales
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Lancer le bot
     print("✅ Bot prêt ! En attente de messages...")
