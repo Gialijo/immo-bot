@@ -16,7 +16,7 @@ from openai import OpenAI
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 
-# Client OpenAI pour la transcription
+# Client OpenAI pour la transcription ET l'extraction IA
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
 # On garde en mémoire les infos collectées pour chaque conversation
@@ -25,8 +25,8 @@ conversations = {}
 # Les 40 champs qu'on veut remplir pour chaque bien
 CHAMPS_BIEN = {
     # Informations générales
-    "type_bien": None,           # Appartement, Maison, Local commercial...
-    "type_transaction": None,    # Vente, Location
+    "type_bien": None,
+    "type_transaction": None,
     "prix": None,
     "adresse": None,
     "code_postal": None,
@@ -59,14 +59,14 @@ CHAMPS_BIEN = {
     "interphone": None,
 
     # État et énergie
-    "etat_general": None,        # Neuf, Bon, À rafraîchir, À rénover
+    "etat_general": None,
     "annee_construction": None,
-    "dpe_classe": None,          # A, B, C, D, E, F, G
+    "dpe_classe": None,
     "dpe_valeur": None,
     "ges_classe": None,
     "ges_valeur": None,
-    "type_chauffage": None,      # Individuel, Collectif
-    "energie_chauffage": None,   # Gaz, Électrique, Fioul, Bois...
+    "type_chauffage": None,
+    "energie_chauffage": None,
 
     # Charges et copropriété
     "charges_copro_mois": None,
@@ -85,6 +85,78 @@ CHAMPS_BIEN = {
     "notes_agent": None,
 }
 
+# Le prompt système pour l'IA
+PROMPT_EXTRACTION = """Tu es un assistant spécialisé en immobilier. Ton rôle est d'extraire les informations d'un bien immobilier à partir du message d'un agent immobilier.
+
+L'agent te parle de manière naturelle, parfois informelle. Tu dois comprendre ce qu'il dit et extraire les informations correspondantes.
+
+Voici les champs à remplir :
+
+INFORMATIONS GÉNÉRALES :
+- type_bien : Appartement, Maison, Studio, Loft, Local commercial, Terrain, Immeuble...
+- type_transaction : Vente ou Location
+- prix : en euros (nombre uniquement, ex: 280000)
+- adresse : adresse de la rue
+- code_postal : code postal (5 chiffres)
+- ville : nom de la ville
+- etage : numéro de l'étage (0 = RDC)
+- nombre_etages_immeuble : nombre total d'étages de l'immeuble
+
+SURFACES :
+- surface_habitable : en m² (nombre uniquement)
+- surface_terrain : en m² (nombre uniquement)
+- surface_sejour : en m² (nombre uniquement)
+- surface_cuisine : en m² (nombre uniquement)
+
+PIÈCES :
+- nombre_pieces : nombre total de pièces
+- nombre_chambres : nombre de chambres
+- nombre_sdb : nombre de salles de bain / salles d'eau
+- nombre_wc : nombre de WC / toilettes
+
+CARACTÉRISTIQUES (répondre Oui ou Non) :
+- balcon, terrasse, jardin, cave, parking, garage, piscine, ascenseur, digicode, interphone
+
+ÉTAT ET ÉNERGIE :
+- etat_general : Neuf, Très bon, Bon, À rafraîchir, À rénover
+- annee_construction : année (ex: 1975)
+- dpe_classe : lettre de A à G
+- dpe_valeur : valeur numérique du DPE
+- ges_classe : lettre de A à G
+- ges_valeur : valeur numérique du GES
+- type_chauffage : Individuel ou Collectif
+- energie_chauffage : Gaz, Électrique, Fioul, Bois, Pompe à chaleur, Mixte...
+
+CHARGES ET COPROPRIÉTÉ :
+- charges_copro_mois : en euros/mois (nombre uniquement)
+- taxe_fonciere_an : en euros/an (nombre uniquement)
+- nombre_lots_copro : nombre de lots dans la copropriété
+- syndic : nom du syndic
+
+INFORMATIONS VENDEUR :
+- nom_proprietaire : nom du propriétaire
+- tel_proprietaire : numéro de téléphone
+- email_proprietaire : adresse email
+
+NOTES :
+- points_forts : les atouts du bien (texte libre)
+- points_faibles : les défauts du bien (texte libre)
+- notes_agent : observations personnelles de l'agent (texte libre)
+
+RÈGLES IMPORTANTES :
+1. Extrais UNIQUEMENT les informations clairement mentionnées dans le message.
+2. Si une info n'est pas mentionnée, NE L'INCLUS PAS dans ta réponse.
+3. Pour "T3", "T4" etc., déduis : T3 = 3 pièces, type_bien = Appartement.
+4. Pour les prix : "280k" = 280000, "1.2M" = 1200000.
+5. Si l'agent dit "pas d'ascenseur", mets ascenseur = "Non".
+6. Si l'agent mentionne un point positif ("belle vue", "lumineux"), ajoute-le dans points_forts.
+7. Si l'agent mentionne un défaut ("bruyant", "à refaire"), ajoute-le dans points_faibles.
+
+Réponds UNIQUEMENT avec un objet JSON contenant les champs extraits. Pas de texte avant ou après.
+Exemple de réponse :
+{"type_bien": "Appartement", "nombre_pieces": 3, "surface_habitable": 65, "ville": "Lyon", "prix": 280000}
+"""
+
 # Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -93,7 +165,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- Fonction de transcription ---
+# --- Fonctions utilitaires ---
 
 async def transcrire_audio(file_path: str) -> str:
     """Transcrit un fichier audio en texte avec Whisper"""
@@ -113,6 +185,107 @@ async def transcrire_audio(file_path: str) -> str:
         return f"❌ Erreur lors de la transcription : {e}"
 
 
+async def extraire_champs(message: str, fiche_actuelle: dict) -> dict:
+    """Utilise l'IA pour extraire les champs du message"""
+    if not openai_client:
+        return {}
+
+    try:
+        # On envoie aussi la fiche actuelle pour le contexte
+        champs_deja_remplis = {k: v for k, v in fiche_actuelle.items() if v is not None}
+        contexte = ""
+        if champs_deja_remplis:
+            contexte = f"\n\nChamps déjà remplis (pour contexte, ne pas répéter) :\n{json.dumps(champs_deja_remplis, ensure_ascii=False)}"
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": PROMPT_EXTRACTION},
+                {"role": "user", "content": f"Message de l'agent : \"{message}\"{contexte}"}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+
+        resultat = response.choices[0].message.content
+        champs_extraits = json.loads(resultat)
+
+        # Nettoyer : ne garder que les champs valides
+        champs_valides = {}
+        for champ, valeur in champs_extraits.items():
+            if champ in CHAMPS_BIEN and valeur is not None and valeur != "":
+                champs_valides[champ] = valeur
+
+        return champs_valides
+
+    except Exception as e:
+        logger.error(f"Erreur extraction IA: {e}")
+        return {}
+
+
+def formater_nouveaux_champs(champs: dict) -> str:
+    """Formate les champs nouvellement extraits pour l'affichage"""
+    if not champs:
+        return "🤔 Je n'ai pas trouvé de nouvelles infos dans ton message."
+
+    lignes = ["🧠 *Infos extraites :*\n"]
+    for champ, valeur in champs.items():
+        label = champ.replace("_", " ").capitalize()
+        lignes.append(f"  ✅ {label} → {valeur}")
+
+    return "\n".join(lignes)
+
+
+async def traiter_texte(user_id: int, texte: str) -> str:
+    """Traite un texte (écrit ou transcrit) : extraction IA + mise à jour fiche"""
+    if user_id not in conversations:
+        conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+
+    fiche = conversations[user_id]
+
+    # Extraction IA
+    nouveaux_champs = await extraire_champs(texte, fiche)
+
+    # Mettre à jour la fiche
+    for champ, valeur in nouveaux_champs.items():
+        # Pour les notes (points_forts, points_faibles, notes_agent),
+        # on accumule au lieu de remplacer
+        if champ in ["points_forts", "points_faibles", "notes_agent"]:
+            if fiche[champ] is not None:
+                fiche[champ] = fiche[champ] + " | " + str(valeur)
+            else:
+                fiche[champ] = str(valeur)
+        else:
+            fiche[champ] = valeur
+
+    # Compter la progression
+    remplis = sum(1 for v in fiche.values() if v is not None)
+    total = len(fiche)
+
+    # Construire la réponse
+    reponse = formater_nouveaux_champs(nouveaux_champs)
+    reponse += f"\n\n📋 Fiche : {remplis}/{total} champs remplis"
+
+    # Suggestions de champs manquants importants
+    champs_prioritaires = {
+        "type_bien": "Type de bien",
+        "prix": "Prix",
+        "surface_habitable": "Surface",
+        "ville": "Ville",
+        "nombre_pieces": "Nombre de pièces",
+        "dpe_classe": "DPE",
+    }
+    manquants_importants = [
+        label for champ, label in champs_prioritaires.items()
+        if fiche.get(champ) is None
+    ]
+
+    if manquants_importants and remplis > 0:
+        reponse += "\n\n💡 _Il me manque encore : " + ", ".join(manquants_importants) + "_"
+
+    return reponse
+
+
 # --- Commandes du bot ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,11 +299,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tu peux m'envoyer :\n"
         "💬 Des messages écrits\n"
         "🎤 Des notes vocales\n\n"
-        "Par exemple, dis-moi ou écris-moi :\n"
+        "Par exemple :\n"
         "« C'est un T3 de 65m² au 2ème étage, rue de la Paix à Lyon. "
-        "Prix vendeur 280k. Bon état général, DPE D. "
-        "Il y a un balcon et une cave. Charges 150€/mois. »\n\n"
-        "Tu peux m'envoyer les infos en plusieurs messages, petit à petit.\n\n"
+        "Prix vendeur 280k. Bon état, DPE D. "
+        "Balcon, cave. Charges 150€/mois. »\n\n"
+        "🧠 Je comprends ce que tu dis et je remplis la fiche automatiquement !\n\n"
         "📋 /fiche → voir la fiche en cours\n"
         "❓ /manque → voir les champs à remplir\n"
         "🗑️ /reset → recommencer une nouvelle fiche"
@@ -212,73 +385,61 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reçoit tous les messages texte de l'utilisateur"""
+    """Reçoit tous les messages texte et les analyse avec l'IA"""
     user_id = update.effective_user.id
     texte = update.message.text
 
-    if user_id not in conversations:
-        conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+    # Envoyer un message "en cours d'analyse"
+    processing_msg = await update.message.reply_text("🧠 J'analyse ton message...")
 
-    fiche = conversations[user_id]
-    remplis = sum(1 for v in fiche.values() if v is not None)
-    total = len(fiche)
+    # Traiter le texte avec l'IA
+    reponse = await traiter_texte(user_id, texte)
 
-    await update.message.reply_text(
-        f"✅ Bien noté ! J'ai enregistré ton message.\n\n"
-        f"📋 Fiche : {remplis}/{total} champs remplis\n\n"
-        f"💡 _Dans la prochaine version, je comprendrai automatiquement "
-        f"les infos et remplirai la fiche tout seul !_\n\n"
-        f"Ton message : « {texte[:100]}{'...' if len(texte) > 100 else ''} »",
-        parse_mode="Markdown",
-    )
+    await processing_msg.edit_text(reponse, parse_mode="Markdown")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reçoit les notes vocales et les transcrit"""
+    """Reçoit les notes vocales, les transcrit, puis les analyse"""
     user_id = update.effective_user.id
 
     if user_id not in conversations:
         conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
 
-    # Envoyer un message "en cours de traitement"
+    # Étape 1 : Transcrire
     processing_msg = await update.message.reply_text("🎤 Je transcris ta note vocale...")
 
     try:
-        # Récupérer le fichier audio depuis Telegram
         voice = update.message.voice
         voice_file = await context.bot.get_file(voice.file_id)
 
-        # Télécharger dans un fichier temporaire
         with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
             await voice_file.download_to_drive(tmp.name)
             tmp_path = tmp.name
 
-        # Transcrire avec Whisper
         texte = await transcrire_audio(tmp_path)
-
-        # Supprimer le fichier temporaire
         os.unlink(tmp_path)
 
         if texte.startswith("❌"):
             await processing_msg.edit_text(texte)
             return
 
-        # Afficher la transcription
-        fiche = conversations[user_id]
-        remplis = sum(1 for v in fiche.values() if v is not None)
-        total = len(fiche)
-
-        duree = voice.duration
+        # Étape 2 : Analyser avec l'IA
         await processing_msg.edit_text(
-            f"🎤 *Note vocale transcrite !* ({duree}s)\n\n"
-            f"📝 Texte : « {texte} »\n\n"
-            f"📋 Fiche : {remplis}/{total} champs remplis\n\n"
-            f"💡 _Dans la prochaine version, je comprendrai automatiquement "
-            f"les infos et remplirai la fiche tout seul !_",
-            parse_mode="Markdown",
+            f"🎤 Transcription : « {texte} »\n\n🧠 J'analyse les infos..."
         )
 
-        logger.info(f"Transcription réussie ({duree}s): {texte[:100]}")
+        reponse = await traiter_texte(user_id, texte)
+
+        duree = voice.duration
+        message_final = (
+            f"🎤 *Note vocale* ({duree}s) :\n"
+            f"« {texte} »\n\n"
+            f"{reponse}"
+        )
+
+        await processing_msg.edit_text(message_final, parse_mode="Markdown")
+
+        logger.info(f"Vocal traité ({duree}s): {texte[:100]}")
 
     except Exception as e:
         logger.error(f"Erreur traitement vocal: {e}")
@@ -293,14 +454,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         print("❌ ERREUR: La variable TELEGRAM_BOT_TOKEN n'est pas définie !")
-        print("   Ajoute-la dans les variables d'environnement de Railway.")
         return
 
     if not OPENAI_KEY:
         print("⚠️ ATTENTION: La variable OPENAI_API_KEY n'est pas définie !")
-        print("   Les notes vocales ne fonctionneront pas sans cette clé.")
+        print("   Les notes vocales et l'extraction IA ne fonctionneront pas.")
 
-    print("🚀 Démarrage du bot...")
+    print("🚀 Démarrage du bot avec IA activée...")
 
     app = Application.builder().token(TOKEN).build()
 
@@ -317,7 +477,7 @@ def main():
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
     # Lancer le bot
-    print("✅ Bot prêt ! En attente de messages...")
+    print("✅ Bot prêt ! IA active, en attente de messages...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
