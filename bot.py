@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import tempfile
+from datetime import datetime
 from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
@@ -11,6 +12,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from openai import OpenAI
+from fpdf import FPDF
 
 # --- Configuration ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -24,7 +26,6 @@ conversations = {}
 
 # Les 40 champs qu'on veut remplir pour chaque bien
 CHAMPS_BIEN = {
-    # Informations générales
     "type_bien": None,
     "type_transaction": None,
     "prix": None,
@@ -33,20 +34,14 @@ CHAMPS_BIEN = {
     "ville": None,
     "etage": None,
     "nombre_etages_immeuble": None,
-
-    # Surfaces
     "surface_habitable": None,
     "surface_terrain": None,
     "surface_sejour": None,
     "surface_cuisine": None,
-
-    # Pièces
     "nombre_pieces": None,
     "nombre_chambres": None,
     "nombre_sdb": None,
     "nombre_wc": None,
-
-    # Caractéristiques
     "balcon": None,
     "terrasse": None,
     "jardin": None,
@@ -57,8 +52,6 @@ CHAMPS_BIEN = {
     "ascenseur": None,
     "digicode": None,
     "interphone": None,
-
-    # État et énergie
     "etat_general": None,
     "annee_construction": None,
     "dpe_classe": None,
@@ -67,19 +60,13 @@ CHAMPS_BIEN = {
     "ges_valeur": None,
     "type_chauffage": None,
     "energie_chauffage": None,
-
-    # Charges et copropriété
     "charges_copro_mois": None,
     "taxe_fonciere_an": None,
     "nombre_lots_copro": None,
     "syndic": None,
-
-    # Informations vendeur
     "nom_proprietaire": None,
     "tel_proprietaire": None,
     "email_proprietaire": None,
-
-    # Notes
     "points_forts": None,
     "points_faibles": None,
     "notes_agent": None,
@@ -171,7 +158,6 @@ async def transcrire_audio(file_path: str) -> str:
     """Transcrit un fichier audio en texte avec Whisper"""
     if not openai_client:
         return "❌ Erreur : clé OpenAI non configurée."
-
     try:
         with open(file_path, "rb") as audio_file:
             transcription = openai_client.audio.transcriptions.create(
@@ -189,9 +175,7 @@ async def extraire_champs(message: str, fiche_actuelle: dict) -> dict:
     """Utilise l'IA pour extraire les champs du message"""
     if not openai_client:
         return {}
-
     try:
-        # On envoie aussi la fiche actuelle pour le contexte
         champs_deja_remplis = {k: v for k, v in fiche_actuelle.items() if v is not None}
         contexte = ""
         if champs_deja_remplis:
@@ -206,16 +190,13 @@ async def extraire_champs(message: str, fiche_actuelle: dict) -> dict:
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-
         resultat = response.choices[0].message.content
         champs_extraits = json.loads(resultat)
 
-        # Nettoyer : ne garder que les champs valides
         champs_valides = {}
         for champ, valeur in champs_extraits.items():
             if champ in CHAMPS_BIEN and valeur is not None and valeur != "":
                 champs_valides[champ] = valeur
-
         return champs_valides
 
     except Exception as e:
@@ -227,29 +208,22 @@ def formater_nouveaux_champs(champs: dict) -> str:
     """Formate les champs nouvellement extraits pour l'affichage"""
     if not champs:
         return "🤔 Je n'ai pas trouvé de nouvelles infos dans ton message."
-
     lignes = ["🧠 *Infos extraites :*\n"]
     for champ, valeur in champs.items():
         label = champ.replace("_", " ").capitalize()
         lignes.append(f"  ✅ {label} → {valeur}")
-
     return "\n".join(lignes)
 
 
 async def traiter_texte(user_id: int, texte: str) -> str:
-    """Traite un texte (écrit ou transcrit) : extraction IA + mise à jour fiche"""
+    """Traite un texte : extraction IA + mise à jour fiche"""
     if user_id not in conversations:
         conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
 
     fiche = conversations[user_id]
-
-    # Extraction IA
     nouveaux_champs = await extraire_champs(texte, fiche)
 
-    # Mettre à jour la fiche
     for champ, valeur in nouveaux_champs.items():
-        # Pour les notes (points_forts, points_faibles, notes_agent),
-        # on accumule au lieu de remplacer
         if champ in ["points_forts", "points_faibles", "notes_agent"]:
             if fiche[champ] is not None:
                 fiche[champ] = fiche[champ] + " | " + str(valeur)
@@ -258,15 +232,12 @@ async def traiter_texte(user_id: int, texte: str) -> str:
         else:
             fiche[champ] = valeur
 
-    # Compter la progression
     remplis = sum(1 for v in fiche.values() if v is not None)
     total = len(fiche)
 
-    # Construire la réponse
     reponse = formater_nouveaux_champs(nouveaux_champs)
     reponse += f"\n\n📋 Fiche : {remplis}/{total} champs remplis"
 
-    # Suggestions de champs manquants importants
     champs_prioritaires = {
         "type_bien": "Type de bien",
         "prix": "Prix",
@@ -279,17 +250,182 @@ async def traiter_texte(user_id: int, texte: str) -> str:
         label for champ, label in champs_prioritaires.items()
         if fiche.get(champ) is None
     ]
-
     if manquants_importants and remplis > 0:
         reponse += "\n\n💡 _Il me manque encore : " + ", ".join(manquants_importants) + "_"
 
     return reponse
 
 
+# --- Génération du PDF ---
+
+def generer_pdf(fiche: dict) -> str:
+    """Génère un PDF propre de la fiche de bien et retourne le chemin du fichier"""
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=20)
+
+    # --- En-tête ---
+    pdf.set_fill_color(41, 65, 122)  # Bleu foncé
+    pdf.rect(0, 0, 210, 40, "F")
+
+    pdf.set_font("Helvetica", "B", 22)
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_y(8)
+    pdf.cell(0, 12, "FICHE DE BIEN IMMOBILIER", new_x="LMARGIN", new_y="NEXT", align="C")
+
+    # Sous-titre avec type + ville
+    sous_titre = ""
+    if fiche.get("type_bien"):
+        sous_titre += str(fiche["type_bien"])
+    if fiche.get("ville"):
+        sous_titre += f" - {fiche['ville']}"
+    if fiche.get("prix"):
+        sous_titre += f" - {fiche['prix']} EUR"
+
+    if sous_titre:
+        pdf.set_font("Helvetica", "", 13)
+        pdf.cell(0, 10, sous_titre, new_x="LMARGIN", new_y="NEXT", align="C")
+
+    pdf.set_y(45)
+
+    # --- Fonctions d'aide ---
+    def titre_section(nom):
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(41, 65, 122)
+        pdf.set_fill_color(230, 236, 245)
+        pdf.cell(0, 9, f"  {nom}", new_x="LMARGIN", new_y="NEXT", align="L", fill=True)
+        pdf.ln(2)
+
+    def ligne_info(label, valeur):
+        if valeur is None:
+            return
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(70, 7, f"  {label}", new_x="RIGHT", new_y="TOP")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 30)
+        pdf.cell(0, 7, str(valeur), new_x="LMARGIN", new_y="NEXT")
+
+    def ligne_oui_non(label, valeur):
+        if valeur is None:
+            return
+        val_str = str(valeur)
+        symbole = "OUI" if val_str.lower() in ["oui", "true", "yes", "1"] else "NON"
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(70, 7, f"  {label}", new_x="RIGHT", new_y="TOP")
+        pdf.set_font("Helvetica", "", 10)
+        if symbole == "OUI":
+            pdf.set_text_color(39, 137, 68)
+        else:
+            pdf.set_text_color(180, 60, 60)
+        pdf.cell(0, 7, symbole, new_x="LMARGIN", new_y="NEXT")
+        pdf.set_text_color(30, 30, 30)
+
+    def bloc_texte(label, valeur):
+        if valeur is None:
+            return
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(0, 7, f"  {label} :", new_x="LMARGIN", new_y="NEXT")
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_x(20)
+        pdf.multi_cell(170, 6, str(valeur))
+        pdf.ln(2)
+
+    # --- Informations Générales ---
+    titre_section("INFORMATIONS GENERALES")
+    ligne_info("Type de bien", fiche.get("type_bien"))
+    ligne_info("Transaction", fiche.get("type_transaction"))
+    ligne_info("Prix", f"{fiche['prix']} EUR" if fiche.get("prix") else None)
+    ligne_info("Adresse", fiche.get("adresse"))
+    ligne_info("Code postal", fiche.get("code_postal"))
+    ligne_info("Ville", fiche.get("ville"))
+    ligne_info("Etage", fiche.get("etage"))
+    ligne_info("Etages immeuble", fiche.get("nombre_etages_immeuble"))
+    pdf.ln(3)
+
+    # --- Surfaces ---
+    titre_section("SURFACES")
+    ligne_info("Surface habitable", f"{fiche['surface_habitable']} m2" if fiche.get("surface_habitable") else None)
+    ligne_info("Surface terrain", f"{fiche['surface_terrain']} m2" if fiche.get("surface_terrain") else None)
+    ligne_info("Surface sejour", f"{fiche['surface_sejour']} m2" if fiche.get("surface_sejour") else None)
+    ligne_info("Surface cuisine", f"{fiche['surface_cuisine']} m2" if fiche.get("surface_cuisine") else None)
+    pdf.ln(3)
+
+    # --- Pièces ---
+    titre_section("PIECES")
+    ligne_info("Nombre de pieces", fiche.get("nombre_pieces"))
+    ligne_info("Chambres", fiche.get("nombre_chambres"))
+    ligne_info("Salles de bain", fiche.get("nombre_sdb"))
+    ligne_info("WC", fiche.get("nombre_wc"))
+    pdf.ln(3)
+
+    # --- Caractéristiques ---
+    titre_section("CARACTERISTIQUES")
+    ligne_oui_non("Balcon", fiche.get("balcon"))
+    ligne_oui_non("Terrasse", fiche.get("terrasse"))
+    ligne_oui_non("Jardin", fiche.get("jardin"))
+    ligne_oui_non("Cave", fiche.get("cave"))
+    ligne_oui_non("Parking", fiche.get("parking"))
+    ligne_oui_non("Garage", fiche.get("garage"))
+    ligne_oui_non("Piscine", fiche.get("piscine"))
+    ligne_oui_non("Ascenseur", fiche.get("ascenseur"))
+    ligne_oui_non("Digicode", fiche.get("digicode"))
+    ligne_oui_non("Interphone", fiche.get("interphone"))
+    pdf.ln(3)
+
+    # --- État et Énergie ---
+    titre_section("ETAT ET ENERGIE")
+    ligne_info("Etat general", fiche.get("etat_general"))
+    ligne_info("Annee de construction", fiche.get("annee_construction"))
+    ligne_info("DPE Classe", fiche.get("dpe_classe"))
+    ligne_info("DPE Valeur", fiche.get("dpe_valeur"))
+    ligne_info("GES Classe", fiche.get("ges_classe"))
+    ligne_info("GES Valeur", fiche.get("ges_valeur"))
+    ligne_info("Type de chauffage", fiche.get("type_chauffage"))
+    ligne_info("Energie chauffage", fiche.get("energie_chauffage"))
+    pdf.ln(3)
+
+    # --- Charges et Copropriété ---
+    titre_section("CHARGES ET COPROPRIETE")
+    ligne_info("Charges copro/mois", f"{fiche['charges_copro_mois']} EUR" if fiche.get("charges_copro_mois") else None)
+    ligne_info("Taxe fonciere/an", f"{fiche['taxe_fonciere_an']} EUR" if fiche.get("taxe_fonciere_an") else None)
+    ligne_info("Nombre de lots", fiche.get("nombre_lots_copro"))
+    ligne_info("Syndic", fiche.get("syndic"))
+    pdf.ln(3)
+
+    # --- Propriétaire ---
+    titre_section("PROPRIETAIRE")
+    ligne_info("Nom", fiche.get("nom_proprietaire"))
+    ligne_info("Telephone", fiche.get("tel_proprietaire"))
+    ligne_info("Email", fiche.get("email_proprietaire"))
+    pdf.ln(3)
+
+    # --- Notes ---
+    titre_section("NOTES ET OBSERVATIONS")
+    bloc_texte("Points forts", fiche.get("points_forts"))
+    bloc_texte("Points faibles", fiche.get("points_faibles"))
+    bloc_texte("Notes agent", fiche.get("notes_agent"))
+
+    # --- Pied de page ---
+    pdf.ln(10)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(150, 150, 150)
+    date_str = datetime.now().strftime("%d/%m/%Y a %Hh%M")
+    pdf.cell(0, 5, f"Fiche generee automatiquement par ImmoAssist le {date_str}", align="C")
+
+    # Sauvegarder
+    tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    pdf.output(tmp.name)
+    return tmp.name
+
+
 # --- Commandes du bot ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quand l'utilisateur tape /start"""
     user_id = update.effective_user.id
     conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
 
@@ -306,12 +442,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧠 Je comprends ce que tu dis et je remplis la fiche automatiquement !\n\n"
         "📋 /fiche → voir la fiche en cours\n"
         "❓ /manque → voir les champs à remplir\n"
+        "📄 /export → générer le PDF de la fiche\n"
         "🗑️ /reset → recommencer une nouvelle fiche"
     )
 
 
 async def voir_fiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quand l'utilisateur tape /fiche — affiche les champs remplis"""
     user_id = update.effective_user.id
     fiche = conversations.get(user_id, {})
 
@@ -355,7 +491,6 @@ async def voir_fiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def voir_manque(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quand l'utilisateur tape /manque — affiche les champs vides"""
     user_id = update.effective_user.id
     fiche = conversations.get(user_id, {})
 
@@ -375,7 +510,6 @@ async def voir_manque(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Quand l'utilisateur tape /reset — remet la fiche à zéro"""
     user_id = update.effective_user.id
     conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
     await update.message.reply_text(
@@ -384,17 +518,64 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Génère et envoie le PDF de la fiche"""
+    user_id = update.effective_user.id
+    fiche = conversations.get(user_id, {})
+
+    if not fiche or all(v is None for v in fiche.values()):
+        await update.message.reply_text(
+            "📋 La fiche est vide ! Envoie-moi d'abord des infos sur le bien."
+        )
+        return
+
+    processing_msg = await update.message.reply_text("📄 Je génère le PDF...")
+
+    try:
+        # Générer le PDF
+        pdf_path = generer_pdf(fiche)
+
+        # Construire le nom du fichier
+        nom_fichier = "Fiche"
+        if fiche.get("type_bien"):
+            nom_fichier += f"_{fiche['type_bien']}"
+        if fiche.get("ville"):
+            nom_fichier += f"_{fiche['ville']}"
+        nom_fichier += f"_{datetime.now().strftime('%d%m%Y')}.pdf"
+        nom_fichier = nom_fichier.replace(" ", "_")
+
+        # Envoyer le PDF
+        with open(pdf_path, "rb") as pdf_file:
+            await update.message.reply_document(
+                document=pdf_file,
+                filename=nom_fichier,
+                caption="📄 Voici ta fiche de bien ! Tu peux l'imprimer ou l'envoyer directement."
+            )
+
+        # Supprimer le fichier temporaire
+        os.unlink(pdf_path)
+
+        # Supprimer le message "en cours"
+        await processing_msg.delete()
+
+        remplis = sum(1 for v in fiche.values() if v is not None)
+        total = len(fiche)
+        logger.info(f"PDF généré: {nom_fichier} ({remplis}/{total} champs)")
+
+    except Exception as e:
+        logger.error(f"Erreur génération PDF: {e}")
+        await processing_msg.edit_text(
+            f"❌ Erreur lors de la génération du PDF.\nDétail : {e}"
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Reçoit tous les messages texte et les analyse avec l'IA"""
     user_id = update.effective_user.id
     texte = update.message.text
 
-    # Envoyer un message "en cours d'analyse"
     processing_msg = await update.message.reply_text("🧠 J'analyse ton message...")
-
-    # Traiter le texte avec l'IA
     reponse = await traiter_texte(user_id, texte)
-
     await processing_msg.edit_text(reponse, parse_mode="Markdown")
 
 
@@ -405,7 +586,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in conversations:
         conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
 
-    # Étape 1 : Transcrire
     processing_msg = await update.message.reply_text("🎤 Je transcris ta note vocale...")
 
     try:
@@ -423,7 +603,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await processing_msg.edit_text(texte)
             return
 
-        # Étape 2 : Analyser avec l'IA
         await processing_msg.edit_text(
             f"🎤 Transcription : « {texte} »\n\n🧠 J'analyse les infos..."
         )
@@ -436,7 +615,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"« {texte} »\n\n"
             f"{reponse}"
         )
-
         await processing_msg.edit_text(message_final, parse_mode="Markdown")
 
         logger.info(f"Vocal traité ({duree}s): {texte[:100]}")
@@ -444,8 +622,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Erreur traitement vocal: {e}")
         await processing_msg.edit_text(
-            f"❌ Erreur lors du traitement de la note vocale.\n"
-            f"Détail : {e}"
+            f"❌ Erreur lors du traitement de la note vocale.\nDétail : {e}"
         )
 
 
@@ -458,26 +635,20 @@ def main():
 
     if not OPENAI_KEY:
         print("⚠️ ATTENTION: La variable OPENAI_API_KEY n'est pas définie !")
-        print("   Les notes vocales et l'extraction IA ne fonctionneront pas.")
 
-    print("🚀 Démarrage du bot avec IA activée...")
+    print("🚀 Démarrage du bot avec IA + PDF...")
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commandes
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("fiche", voir_fiche))
     app.add_handler(CommandHandler("manque", voir_manque))
     app.add_handler(CommandHandler("reset", reset))
-
-    # Messages texte
+    app.add_handler(CommandHandler("export", export_pdf))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Notes vocales
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    # Lancer le bot
-    print("✅ Bot prêt ! IA active, en attente de messages...")
+    print("✅ Bot prêt ! IA + PDF actifs, en attente de messages...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
