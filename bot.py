@@ -23,7 +23,6 @@ TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
-
 conversations = {}
 
 
@@ -137,15 +136,6 @@ LIBELLES = {
     "email_proprietaire": "Email propriétaire",
     "tel_proprietaire": "Téléphone propriétaire",
 }
-
-ETATS_AUTORISES = [
-    "A rafraichir",
-    "A renover",
-    "Bon etat",
-    "En excellent etat",
-    "Gros travaux a prevoir",
-    "Parfait etat",
-]
 
 DPE_AUTORISES = ["A", "B", "C", "D", "E", "F", "NC"]
 
@@ -276,10 +266,12 @@ def normaliser_chaine(valeur):
 def normaliser_nombre(valeur):
     if valeur is None:
         return None
+
     if isinstance(valeur, (int, float)):
         return int(valeur) if float(valeur).is_integer() else float(valeur)
 
-    texte = str(valeur).strip().lower().replace("€", "").replace("eur", "")
+    texte = str(valeur).strip().lower()
+    texte = texte.replace("€", "").replace("eur", "")
     texte = texte.replace(",", ".")
     texte = texte.replace("m²", "").replace("m2", "").strip()
 
@@ -334,11 +326,12 @@ def normaliser_dpe(valeur):
 def normaliser_etat(valeur):
     if valeur is None:
         return None
+
     mapping = {
         "a rafraichir": "A rafraichir",
         "à rafraichir": "A rafraichir",
-        "a rénover": "A renover",
         "a renover": "A renover",
+        "a rénover": "A renover",
         "à renover": "A renover",
         "à rénover": "A renover",
         "bon etat": "Bon etat",
@@ -352,6 +345,7 @@ def normaliser_etat(valeur):
         "parfait etat": "Parfait etat",
         "parfait état": "Parfait etat",
     }
+
     texte = str(valeur).strip().lower()
     return mapping.get(texte, str(valeur).strip())
 
@@ -397,7 +391,7 @@ def normaliser_valeur(champ, valeur):
         return normaliser_etat(valeur)
     if champ == "libre_ou_occupe":
         texte = str(valeur).strip().lower()
-        if texte in ["libre"]:
+        if texte == "libre":
             return "Libre"
         if texte in ["occupe", "occupé"]:
             return "Occupé"
@@ -510,30 +504,6 @@ def champs_manquants_secondaires(fiche: dict):
     return manquants
 
 
-def question_pour_champ(champ):
-    questions = {
-        "type_bien": "C’est un Appartement, une Maison ou un Hôtel Particulier ?",
-        "adresse": "Quelle est l’adresse du bien ?",
-        "ville": "Dans quelle ville se trouve le bien ?",
-        "nom_proprietaire": "Quel est le nom et prénom du propriétaire, ou le nom de la société ?",
-        "etage": "À quel étage se trouve le bien ?",
-        "surface": "Quelle est la surface du bien en m² ?",
-        "nombre_pieces": "Combien de pièces ?",
-        "nombre_chambres": "Combien de chambres ?",
-        "etat_bien": "Quel est l’état du bien ? (A rafraichir, A renover, Bon etat, En excellent etat, Gros travaux a prevoir, Parfait etat)",
-        "etat_parties_communes": "Quel est l’état des parties communes ?",
-        "nombre_salles_bains": "Combien de salles de bains ?",
-        "nombre_salles_eau": "Combien de salles d’eau ?",
-        "wc": "Combien de WC ?",
-        "type_chauffage": "Quel est le type de chauffage ?",
-        "ascenseur": "Y a-t-il un ascenseur ?",
-        "dpe_lettre": "Quelle est la lettre du DPE ? (A, B, C, D, E, F ou NC)",
-        "points_forts_appartement": "Quels sont les points forts de l’appartement ?",
-        "points_faibles_appartement": "Quels sont les points faibles de l’appartement ?",
-    }
-    return questions.get(champ, f"Peux-tu me donner : {LIBELLES.get(champ, champ)} ?")
-
-
 def formater_valeur_pdf(champ, valeur):
     if valeur is None:
         return None
@@ -635,17 +605,17 @@ async def traiter_texte(user_id: int, texte: str) -> str:
 
     manquants = champs_manquants_obligatoires(fiche)
     if manquants:
-        premier = manquants[0]
-        reponse += "\n\n❗ Il me manque encore des champs obligatoires."
-        reponse += f"\n👉 {question_pour_champ(premier)}"
+        reponse += "\n\n❗ *Il me manque encore ces champs obligatoires :*\n"
+        for champ in manquants:
+            reponse += f"\n• {LIBELLES.get(champ, champ)}"
+
+        reponse += "\n\n✍️ Envoie-moi toutes ces infos d’un coup dans un seul message."
+        reponse += "\n\n💡 Si tu veux, je peux aussi te lister les champs secondaires manquants avec la commande /manque"
     else:
         secondaires = champs_manquants_secondaires(fiche)
         if secondaires:
-            labels = [LIBELLES.get(c, c) for c in secondaires[:5]]
-            reponse += "\n\n✨ Obligatoires complets."
-            reponse += "\nIl me manque encore quelques champs secondaires : " + ", ".join(labels)
-            if len(secondaires) > 5:
-                reponse += "..."
+            reponse += "\n\n✅ Tous les champs obligatoires sont remplis."
+            reponse += "\n💡 Si tu veux, je peux aussi te lister les champs secondaires manquants avec la commande /manque"
         else:
             reponse += "\n\n🎉 Tout est rempli."
 
@@ -804,15 +774,14 @@ async def voir_manque(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt += "*Obligatoires :*\n"
         txt += "\n".join(f"• {LIBELLES.get(c, c)}" for c in manquants_obligatoires)
         txt += "\n\n"
-        txt += f"👉 Question suivante : {question_pour_champ(manquants_obligatoires[0])}\n\n"
     else:
         txt += "✅ Tous les champs obligatoires sont remplis.\n\n"
 
     if manquants_secondaires:
         txt += "*Secondaires :*\n"
-        txt += "\n".join(f"• {LIBELLES.get(c, c)}" for c in manquants_secondaires[:15])
-        if len(manquants_secondaires) > 15:
-            txt += f"\n… et {len(manquants_secondaires) - 15} autres"
+        txt += "\n".join(f"• {LIBELLES.get(c, c)}" for c in manquants_secondaires[:20])
+        if len(manquants_secondaires) > 20:
+            txt += f"\n… et {len(manquants_secondaires) - 20} autres"
 
     await update.message.reply_text(txt, parse_mode="Markdown")
 
