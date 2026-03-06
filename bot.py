@@ -2,8 +2,11 @@ import os
 import json
 import logging
 import tempfile
+import re
+from copy import deepcopy
 from datetime import datetime
-from telegram import Update, BotCommand
+
+from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -14,137 +17,235 @@ from telegram.ext import (
 from openai import OpenAI
 from fpdf import FPDF
 
+
 # --- Configuration ---
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY")
 
-# Client OpenAI pour la transcription ET l'extraction IA
 openai_client = OpenAI(api_key=OPENAI_KEY) if OPENAI_KEY else None
 
-# On garde en mémoire les infos collectées pour chaque conversation
 conversations = {}
 
-# Les 40 champs qu'on veut remplir pour chaque bien
+
+# --- Modèle de fiche ---
+
 CHAMPS_BIEN = {
-    "type_bien": None,
-    "type_transaction": None,
-    "prix": None,
+    # Obligatoires
+    "type_bien": None,                  # Appartement / Maison / Hôtel Particulier
     "adresse": None,
-    "code_postal": None,
     "ville": None,
-    "etage": None,
-    "nombre_etages_immeuble": None,
-    "surface_habitable": None,
-    "surface_terrain": None,
-    "surface_sejour": None,
-    "surface_cuisine": None,
+    "nom_proprietaire": None,          # ou nom société
+    "etage": None,                     # sauf maison / hôtel particulier
+    "surface": None,
     "nombre_pieces": None,
     "nombre_chambres": None,
-    "nombre_sdb": None,
-    "nombre_wc": None,
-    "balcon": None,
-    "terrasse": None,
-    "jardin": None,
+    "etat_bien": None,
+    "etat_parties_communes": None,
+    "nombre_salles_bains": None,
+    "nombre_salles_eau": None,
+    "wc": None,
+    "type_chauffage": None,
+    "ascenseur": None,                 # sauf maison / hôtel particulier
+    "dpe_lettre": None,
+    "points_forts_appartement": None,
+    "points_faibles_appartement": None,
+
+    # Secondaires
+    "prix": None,
+    "charges_mois": None,
+    "taxe_fonciere": None,
+    "libre_ou_occupe": None,
     "cave": None,
     "parking": None,
-    "garage": None,
+    "balcon": None,
+    "surface_balcon": None,
+    "terrasse": None,
+    "surface_terrasse": None,
+    "jardin": None,
+    "surface_jardin": None,
+    "nombre_etages_immeuble": None,
+    "annee_construction_immeuble": None,
+    "standing_immeuble": None,
+    "type_cuisine": None,
+    "climatisation": None,
+    "type_fenetre": None,
+    "vue": None,
+    "exposition": None,
+    "hauteur_sous_plafond": None,
     "piscine": None,
-    "ascenseur": None,
+    "annexe": None,
+    "copropriete": None,
+    "georisques": None,
+    "nom_syndic": None,
+    "code_immeuble": None,
     "digicode": None,
     "interphone": None,
-    "etat_general": None,
-    "annee_construction": None,
-    "dpe_classe": None,
-    "dpe_valeur": None,
-    "ges_classe": None,
-    "ges_valeur": None,
-    "type_chauffage": None,
-    "energie_chauffage": None,
-    "charges_copro_mois": None,
-    "taxe_fonciere_an": None,
     "nombre_lots_copro": None,
-    "syndic": None,
-    "nom_proprietaire": None,
-    "tel_proprietaire": None,
     "email_proprietaire": None,
-    "points_forts": None,
-    "points_faibles": None,
-    "notes_agent": None,
+    "tel_proprietaire": None,
 }
 
-# Le prompt système pour l'IA
-PROMPT_EXTRACTION = """Tu es un assistant spécialisé en immobilier. Ton rôle est d'extraire les informations d'un bien immobilier à partir du message d'un agent immobilier.
+LIBELLES = {
+    "type_bien": "Type de bien",
+    "adresse": "Adresse",
+    "ville": "Ville",
+    "nom_proprietaire": "Nom propriétaire / société",
+    "etage": "Étage",
+    "surface": "Surface",
+    "nombre_pieces": "Nombre de pièces",
+    "nombre_chambres": "Nombre de chambres",
+    "etat_bien": "État du bien",
+    "etat_parties_communes": "État des parties communes",
+    "nombre_salles_bains": "Nombre de salles de bains",
+    "nombre_salles_eau": "Nombre de salles d'eau",
+    "wc": "WC",
+    "type_chauffage": "Type de chauffage",
+    "ascenseur": "Ascenseur",
+    "dpe_lettre": "Lettre DPE",
+    "points_forts_appartement": "Points forts appartement",
+    "points_faibles_appartement": "Points faibles appartement",
+    "prix": "Prix",
+    "charges_mois": "Charges / mois",
+    "taxe_fonciere": "Taxe foncière",
+    "libre_ou_occupe": "Libre ou occupé",
+    "cave": "Cave",
+    "parking": "Parking",
+    "balcon": "Balcon",
+    "surface_balcon": "Surface balcon",
+    "terrasse": "Terrasse",
+    "surface_terrasse": "Surface terrasse",
+    "jardin": "Jardin",
+    "surface_jardin": "Surface jardin",
+    "nombre_etages_immeuble": "Nombre d'étages immeuble",
+    "annee_construction_immeuble": "Année construction immeuble",
+    "standing_immeuble": "Standing immeuble",
+    "type_cuisine": "Type de cuisine",
+    "climatisation": "Climatisation",
+    "type_fenetre": "Type de fenêtre",
+    "vue": "Vue",
+    "exposition": "Exposition",
+    "hauteur_sous_plafond": "Hauteur sous plafond",
+    "piscine": "Piscine",
+    "annexe": "Annexe",
+    "copropriete": "Copropriété",
+    "georisques": "Exposé à géorisques",
+    "nom_syndic": "Nom du syndic",
+    "code_immeuble": "Code immeuble",
+    "digicode": "Digicode",
+    "interphone": "Interphone",
+    "nombre_lots_copro": "Nombre de lots de copro",
+    "email_proprietaire": "Email propriétaire",
+    "tel_proprietaire": "Téléphone propriétaire",
+}
 
-L'agent te parle de manière naturelle, parfois informelle. Tu dois comprendre ce qu'il dit et extraire les informations correspondantes.
+ETATS_AUTORISES = [
+    "A rafraichir",
+    "A renover",
+    "Bon etat",
+    "En excellent etat",
+    "Gros travaux a prevoir",
+    "Parfait etat",
+]
 
-Voici les champs à remplir :
+DPE_AUTORISES = ["A", "B", "C", "D", "E", "F", "NC"]
 
-INFORMATIONS GÉNÉRALES :
-- type_bien : Appartement, Maison, Studio, Loft, Local commercial, Terrain, Immeuble...
-- type_transaction : Vente ou Location
-- prix : en euros (nombre uniquement, ex: 280000)
-- adresse : adresse de la rue
-- code_postal : code postal (5 chiffres)
-- ville : nom de la ville
-- etage : numéro de l'étage (0 = RDC)
-- nombre_etages_immeuble : nombre total d'étages de l'immeuble
 
-SURFACES :
-- surface_habitable : en m² (nombre uniquement)
-- surface_terrain : en m² (nombre uniquement)
-- surface_sejour : en m² (nombre uniquement)
-- surface_cuisine : en m² (nombre uniquement)
+# --- Prompt IA ---
 
-PIÈCES :
+PROMPT_EXTRACTION = """
+Tu es un assistant spécialisé en immobilier haut de gamme en France.
+Tu reçois le message libre d'un agent immobilier qui décrit un bien.
+
+Tu dois extraire UNIQUEMENT les informations clairement mentionnées dans le message,
+et répondre UNIQUEMENT avec un objet JSON.
+
+Ne mets jamais de texte avant ou après le JSON.
+
+Champs à extraire :
+
+OBLIGATOIRES
+- type_bien : Appartement, Maison, Hôtel Particulier
+- adresse
+- ville
+- nom_proprietaire : nom et prénom du propriétaire ou nom de la société
+- etage : numéro d'étage, ou 0 pour rez-de-chaussée
+- surface : surface en m² (nombre uniquement)
 - nombre_pieces : nombre total de pièces
 - nombre_chambres : nombre de chambres
-- nombre_sdb : nombre de salles de bain / salles d'eau
-- nombre_wc : nombre de WC / toilettes
+- etat_bien : exactement parmi
+  A rafraichir, A renover, Bon etat, En excellent etat, Gros travaux a prevoir, Parfait etat
+- etat_parties_communes : exactement parmi
+  A rafraichir, A renover, Bon etat, En excellent etat, Gros travaux a prevoir, Parfait etat
+- nombre_salles_bains
+- nombre_salles_eau
+- wc
+- type_chauffage
+- ascenseur : Oui ou Non
+- dpe_lettre : A, B, C, D, E, F, NC
+- points_forts_appartement : texte libre
+- points_faibles_appartement : texte libre
 
-CARACTÉRISTIQUES (répondre Oui ou Non) :
-- balcon, terrasse, jardin, cave, parking, garage, piscine, ascenseur, digicode, interphone
+SECONDAIRES
+- prix : nombre uniquement en euros
+- charges_mois : nombre uniquement en euros
+- taxe_fonciere : nombre uniquement en euros
+- libre_ou_occupe : Libre ou Occupé
+- cave : Oui ou Non
+- parking : Oui ou Non
+- balcon : Oui ou Non
+- surface_balcon : nombre uniquement en m²
+- terrasse : Oui ou Non
+- surface_terrasse : nombre uniquement en m²
+- jardin : Oui ou Non
+- surface_jardin : nombre uniquement en m²
+- nombre_etages_immeuble
+- annee_construction_immeuble
+- standing_immeuble
+- type_cuisine
+- climatisation : Oui ou Non
+- type_fenetre
+- vue
+- exposition
+- hauteur_sous_plafond
+- piscine : Oui ou Non
+- annexe
+- copropriete : Oui ou Non
+- georisques : Oui ou Non
+- nom_syndic
+- code_immeuble
+- digicode : Oui ou Non
+- interphone : Oui ou Non
+- nombre_lots_copro
+- email_proprietaire
+- tel_proprietaire
 
-ÉTAT ET ÉNERGIE :
-- etat_general : Neuf, Très bon, Bon, À rafraîchir, À rénover
-- annee_construction : année (ex: 1975)
-- dpe_classe : lettre de A à G
-- dpe_valeur : valeur numérique du DPE
-- ges_classe : lettre de A à G
-- ges_valeur : valeur numérique du GES
-- type_chauffage : Individuel ou Collectif
-- energie_chauffage : Gaz, Électrique, Fioul, Bois, Pompe à chaleur, Mixte...
+Règles :
+1. N'invente jamais.
+2. Si une info n'est pas dite clairement, ne la mets pas.
+3. Si l'agent dit "T3", "3 pieces", "trois pieces", alors nombre_pieces = 3.
+4. Si l'agent dit "pas d'ascenseur", ascenseur = "Non".
+5. Si l'agent dit "avec ascenseur", ascenseur = "Oui".
+6. Si l'agent dit "DPE inconnu" ou pas encore fait, dpe_lettre = "NC".
+7. Si le bien est décrit comme "hotel particulier" ou "hôtel particulier", type_bien = "Hôtel Particulier".
+8. Réponds avec des nombres simples pour les surfaces, prix, charges, taxe foncière, etc.
+9. Pour les booléens, utilise strictement "Oui" ou "Non".
+10. Pour libre_ou_occupe, utilise strictement "Libre" ou "Occupé".
+11. Si l'agent mentionne des atouts du bien, mets-les dans points_forts_appartement.
+12. Si l'agent mentionne des défauts du bien, mets-les dans points_faibles_appartement.
 
-CHARGES ET COPROPRIÉTÉ :
-- charges_copro_mois : en euros/mois (nombre uniquement)
-- taxe_fonciere_an : en euros/an (nombre uniquement)
-- nombre_lots_copro : nombre de lots dans la copropriété
-- syndic : nom du syndic
-
-INFORMATIONS VENDEUR :
-- nom_proprietaire : nom du propriétaire
-- tel_proprietaire : numéro de téléphone
-- email_proprietaire : adresse email
-
-NOTES :
-- points_forts : les atouts du bien (texte libre)
-- points_faibles : les défauts du bien (texte libre)
-- notes_agent : observations personnelles de l'agent (texte libre)
-
-RÈGLES IMPORTANTES :
-1. Extrais UNIQUEMENT les informations clairement mentionnées dans le message.
-2. Si une info n'est pas mentionnée, NE L'INCLUS PAS dans ta réponse.
-3. Pour "T3", "T4" etc., déduis : T3 = 3 pièces, type_bien = Appartement.
-4. Pour les prix : "280k" = 280000, "1.2M" = 1200000.
-5. Si l'agent dit "pas d'ascenseur", mets ascenseur = "Non".
-6. Si l'agent mentionne un point positif ("belle vue", "lumineux"), ajoute-le dans points_forts.
-7. Si l'agent mentionne un défaut ("bruyant", "à refaire"), ajoute-le dans points_faibles.
-
-Réponds UNIQUEMENT avec un objet JSON contenant les champs extraits. Pas de texte avant ou après.
 Exemple de réponse :
-{"type_bien": "Appartement", "nombre_pieces": 3, "surface_habitable": 65, "ville": "Lyon", "prix": 280000}
+{
+  "type_bien": "Appartement",
+  "ville": "Paris",
+  "surface": 145,
+  "nombre_pieces": 5,
+  "ascenseur": "Oui",
+  "dpe_lettre": "D"
+}
 """
 
-# Logging
+
+# --- Logging ---
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -152,10 +253,300 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- Fonctions utilitaires ---
+# --- Utilitaires ---
+
+def nouvelle_fiche():
+    return deepcopy(CHAMPS_BIEN)
+
+
+def est_oui(valeur):
+    return str(valeur).strip().lower() in ["oui", "true", "1", "yes"]
+
+
+def est_non(valeur):
+    return str(valeur).strip().lower() in ["non", "false", "0", "no"]
+
+
+def normaliser_chaine(valeur):
+    if valeur is None:
+        return None
+    return str(valeur).strip()
+
+
+def normaliser_nombre(valeur):
+    if valeur is None:
+        return None
+    if isinstance(valeur, (int, float)):
+        return int(valeur) if float(valeur).is_integer() else float(valeur)
+
+    texte = str(valeur).strip().lower().replace("€", "").replace("eur", "")
+    texte = texte.replace(",", ".")
+    texte = texte.replace("m²", "").replace("m2", "").strip()
+
+    match = re.match(r"^(\d+(\.\d+)?)\s*k$", texte)
+    if match:
+        return int(float(match.group(1)) * 1000)
+
+    match = re.match(r"^(\d+(\.\d+)?)\s*m$", texte)
+    if match:
+        return int(float(match.group(1)) * 1000000)
+
+    try:
+        num = float(texte)
+        return int(num) if num.is_integer() else num
+    except Exception:
+        return valeur
+
+
+def normaliser_bool_oui_non(valeur):
+    if valeur is None:
+        return None
+    texte = str(valeur).strip().lower()
+    if texte in ["oui", "yes", "true", "1", "avec"]:
+        return "Oui"
+    if texte in ["non", "no", "false", "0", "sans"]:
+        return "Non"
+    return str(valeur).strip()
+
+
+def normaliser_type_bien(valeur):
+    if not valeur:
+        return None
+    texte = str(valeur).strip().lower()
+    if "hotel particulier" in texte or "hôtel particulier" in texte:
+        return "Hôtel Particulier"
+    if "maison" in texte:
+        return "Maison"
+    if "appartement" in texte or texte.startswith("t") or "studio" in texte:
+        return "Appartement"
+    return str(valeur).strip()
+
+
+def normaliser_dpe(valeur):
+    if valeur is None:
+        return None
+    texte = str(valeur).strip().upper()
+    if texte in DPE_AUTORISES:
+        return texte
+    return str(valeur).strip().upper()
+
+
+def normaliser_etat(valeur):
+    if valeur is None:
+        return None
+    mapping = {
+        "a rafraichir": "A rafraichir",
+        "à rafraichir": "A rafraichir",
+        "a rénover": "A renover",
+        "a renover": "A renover",
+        "à renover": "A renover",
+        "à rénover": "A renover",
+        "bon etat": "Bon etat",
+        "bon état": "Bon etat",
+        "en excellent etat": "En excellent etat",
+        "en excellent état": "En excellent etat",
+        "gros travaux a prevoir": "Gros travaux a prevoir",
+        "gros travaux à prevoir": "Gros travaux a prevoir",
+        "gros travaux a prévoir": "Gros travaux a prevoir",
+        "gros travaux à prévoir": "Gros travaux a prevoir",
+        "parfait etat": "Parfait etat",
+        "parfait état": "Parfait etat",
+    }
+    texte = str(valeur).strip().lower()
+    return mapping.get(texte, str(valeur).strip())
+
+
+def normaliser_valeur(champ, valeur):
+    if valeur is None or valeur == "":
+        return None
+
+    champs_numeriques = {
+        "prix",
+        "charges_mois",
+        "taxe_fonciere",
+        "surface",
+        "surface_balcon",
+        "surface_terrasse",
+        "surface_jardin",
+        "nombre_pieces",
+        "nombre_chambres",
+        "nombre_salles_bains",
+        "nombre_salles_eau",
+        "wc",
+        "etage",
+        "nombre_etages_immeuble",
+        "annee_construction_immeuble",
+        "nombre_lots_copro",
+    }
+
+    champs_oui_non = {
+        "ascenseur", "cave", "parking", "balcon", "terrasse", "jardin",
+        "climatisation", "piscine", "copropriete", "georisques",
+        "digicode", "interphone"
+    }
+
+    if champ in champs_numeriques:
+        return normaliser_nombre(valeur)
+    if champ in champs_oui_non:
+        return normaliser_bool_oui_non(valeur)
+    if champ == "type_bien":
+        return normaliser_type_bien(valeur)
+    if champ == "dpe_lettre":
+        return normaliser_dpe(valeur)
+    if champ in {"etat_bien", "etat_parties_communes"}:
+        return normaliser_etat(valeur)
+    if champ == "libre_ou_occupe":
+        texte = str(valeur).strip().lower()
+        if texte in ["libre"]:
+            return "Libre"
+        if texte in ["occupe", "occupé"]:
+            return "Occupé"
+        return str(valeur).strip()
+
+    return normaliser_chaine(valeur)
+
+
+def nettoyer_fiche(fiche: dict):
+    type_bien = fiche.get("type_bien")
+
+    if type_bien in ["Maison", "Hôtel Particulier"]:
+        fiche["etage"] = None
+        fiche["ascenseur"] = None
+
+    if est_non(fiche.get("balcon")):
+        fiche["surface_balcon"] = None
+
+    if est_non(fiche.get("terrasse")):
+        fiche["surface_terrasse"] = None
+
+    if est_non(fiche.get("jardin")):
+        fiche["surface_jardin"] = None
+
+    if est_non(fiche.get("copropriete")):
+        fiche["nom_syndic"] = None
+
+
+def champs_obligatoires_actifs(fiche: dict):
+    obligatoires = [
+        "type_bien",
+        "adresse",
+        "ville",
+        "nom_proprietaire",
+        "surface",
+        "nombre_pieces",
+        "nombre_chambres",
+        "etat_bien",
+        "etat_parties_communes",
+        "nombre_salles_bains",
+        "nombre_salles_eau",
+        "wc",
+        "type_chauffage",
+        "dpe_lettre",
+        "points_forts_appartement",
+        "points_faibles_appartement",
+    ]
+
+    if fiche.get("type_bien") not in ["Maison", "Hôtel Particulier"]:
+        obligatoires.append("etage")
+        obligatoires.append("ascenseur")
+
+    return obligatoires
+
+
+def champs_secondaires():
+    return [
+        "prix",
+        "charges_mois",
+        "taxe_fonciere",
+        "libre_ou_occupe",
+        "cave",
+        "parking",
+        "balcon",
+        "surface_balcon",
+        "terrasse",
+        "surface_terrasse",
+        "jardin",
+        "surface_jardin",
+        "nombre_etages_immeuble",
+        "annee_construction_immeuble",
+        "standing_immeuble",
+        "type_cuisine",
+        "climatisation",
+        "type_fenetre",
+        "vue",
+        "exposition",
+        "hauteur_sous_plafond",
+        "piscine",
+        "annexe",
+        "copropriete",
+        "georisques",
+        "nom_syndic",
+        "code_immeuble",
+        "digicode",
+        "interphone",
+        "nombre_lots_copro",
+        "email_proprietaire",
+        "tel_proprietaire",
+    ]
+
+
+def champs_manquants_obligatoires(fiche: dict):
+    return [c for c in champs_obligatoires_actifs(fiche) if fiche.get(c) in [None, ""]]
+
+
+def champs_manquants_secondaires(fiche: dict):
+    manquants = []
+    for champ in champs_secondaires():
+        if champ == "surface_balcon" and est_non(fiche.get("balcon")):
+            continue
+        if champ == "surface_terrasse" and est_non(fiche.get("terrasse")):
+            continue
+        if champ == "surface_jardin" and est_non(fiche.get("jardin")):
+            continue
+        if champ == "nom_syndic" and est_non(fiche.get("copropriete")):
+            continue
+        if fiche.get(champ) in [None, ""]:
+            manquants.append(champ)
+    return manquants
+
+
+def question_pour_champ(champ):
+    questions = {
+        "type_bien": "C’est un Appartement, une Maison ou un Hôtel Particulier ?",
+        "adresse": "Quelle est l’adresse du bien ?",
+        "ville": "Dans quelle ville se trouve le bien ?",
+        "nom_proprietaire": "Quel est le nom et prénom du propriétaire, ou le nom de la société ?",
+        "etage": "À quel étage se trouve le bien ?",
+        "surface": "Quelle est la surface du bien en m² ?",
+        "nombre_pieces": "Combien de pièces ?",
+        "nombre_chambres": "Combien de chambres ?",
+        "etat_bien": "Quel est l’état du bien ? (A rafraichir, A renover, Bon etat, En excellent etat, Gros travaux a prevoir, Parfait etat)",
+        "etat_parties_communes": "Quel est l’état des parties communes ?",
+        "nombre_salles_bains": "Combien de salles de bains ?",
+        "nombre_salles_eau": "Combien de salles d’eau ?",
+        "wc": "Combien de WC ?",
+        "type_chauffage": "Quel est le type de chauffage ?",
+        "ascenseur": "Y a-t-il un ascenseur ?",
+        "dpe_lettre": "Quelle est la lettre du DPE ? (A, B, C, D, E, F ou NC)",
+        "points_forts_appartement": "Quels sont les points forts de l’appartement ?",
+        "points_faibles_appartement": "Quels sont les points faibles de l’appartement ?",
+    }
+    return questions.get(champ, f"Peux-tu me donner : {LIBELLES.get(champ, champ)} ?")
+
+
+def formater_valeur_pdf(champ, valeur):
+    if valeur is None:
+        return None
+    if champ in {"prix", "charges_mois", "taxe_fonciere"}:
+        return f"{valeur} EUR"
+    if champ in {"surface", "surface_balcon", "surface_terrasse", "surface_jardin", "hauteur_sous_plafond"}:
+        return f"{valeur} m2"
+    return str(valeur)
+
+
+# --- IA / Audio ---
 
 async def transcrire_audio(file_path: str) -> str:
-    """Transcrit un fichier audio en texte avec Whisper"""
     if not openai_client:
         return "❌ Erreur : clé OpenAI non configurée."
     try:
@@ -172,31 +563,36 @@ async def transcrire_audio(file_path: str) -> str:
 
 
 async def extraire_champs(message: str, fiche_actuelle: dict) -> dict:
-    """Utilise l'IA pour extraire les champs du message"""
     if not openai_client:
         return {}
+
     try:
         champs_deja_remplis = {k: v for k, v in fiche_actuelle.items() if v is not None}
         contexte = ""
         if champs_deja_remplis:
-            contexte = f"\n\nChamps déjà remplis (pour contexte, ne pas répéter) :\n{json.dumps(champs_deja_remplis, ensure_ascii=False)}"
+            contexte = (
+                "\n\nContexte de la fiche déjà remplie :\n"
+                + json.dumps(champs_deja_remplis, ensure_ascii=False)
+            )
 
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": PROMPT_EXTRACTION},
-                {"role": "user", "content": f"Message de l'agent : \"{message}\"{contexte}"}
+                {"role": "user", "content": f'Message de l’agent : "{message}"{contexte}'}
             ],
             temperature=0.1,
             response_format={"type": "json_object"},
         )
-        resultat = response.choices[0].message.content
-        champs_extraits = json.loads(resultat)
+
+        contenu = response.choices[0].message.content
+        resultat = json.loads(contenu)
 
         champs_valides = {}
-        for champ, valeur in champs_extraits.items():
-            if champ in CHAMPS_BIEN and valeur is not None and valeur != "":
-                champs_valides[champ] = valeur
+        for champ, valeur in resultat.items():
+            if champ in CHAMPS_BIEN and valeur not in [None, ""]:
+                champs_valides[champ] = normaliser_valeur(champ, valeur)
+
         return champs_valides
 
     except Exception as e:
@@ -205,386 +601,280 @@ async def extraire_champs(message: str, fiche_actuelle: dict) -> dict:
 
 
 def formater_nouveaux_champs(champs: dict) -> str:
-    """Formate les champs nouvellement extraits pour l'affichage"""
     if not champs:
-        return "🤔 Je n'ai pas trouvé de nouvelles infos dans ton message."
+        return "🤔 Je n’ai pas trouvé de nouvelle info exploitable dans ton message."
+
     lignes = ["🧠 *Infos extraites :*\n"]
     for champ, valeur in champs.items():
-        label = champ.replace("_", " ").capitalize()
-        lignes.append(f"  ✅ {label} → {valeur}")
+        lignes.append(f"✅ {LIBELLES.get(champ, champ)} → {valeur}")
     return "\n".join(lignes)
 
 
 async def traiter_texte(user_id: int, texte: str) -> str:
-    """Traite un texte : extraction IA + mise à jour fiche"""
     if user_id not in conversations:
-        conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+        conversations[user_id] = nouvelle_fiche()
 
     fiche = conversations[user_id]
     nouveaux_champs = await extraire_champs(texte, fiche)
 
     for champ, valeur in nouveaux_champs.items():
-        if champ in ["points_forts", "points_faibles", "notes_agent"]:
-            if fiche[champ] is not None:
-                fiche[champ] = fiche[champ] + " | " + str(valeur)
-            else:
-                fiche[champ] = str(valeur)
-        else:
-            fiche[champ] = valeur
+        fiche[champ] = valeur
 
-    remplis = sum(1 for v in fiche.values() if v is not None)
-    total = len(fiche)
+    nettoyer_fiche(fiche)
+
+    obligatoires = champs_obligatoires_actifs(fiche)
+    nb_obligatoires_remplis = sum(1 for c in obligatoires if fiche.get(c) not in [None, ""])
+    nb_obligatoires_total = len(obligatoires)
+
+    nb_total_remplis = sum(1 for v in fiche.values() if v not in [None, ""])
+    nb_total = len(fiche)
 
     reponse = formater_nouveaux_champs(nouveaux_champs)
-    reponse += f"\n\n📋 Fiche : {remplis}/{total} champs remplis"
+    reponse += f"\n\n📌 Obligatoires : {nb_obligatoires_remplis}/{nb_obligatoires_total}"
+    reponse += f"\n📋 Total fiche : {nb_total_remplis}/{nb_total}"
 
-    champs_prioritaires = {
-        "type_bien": "Type de bien",
-        "prix": "Prix",
-        "surface_habitable": "Surface",
-        "ville": "Ville",
-        "nombre_pieces": "Nombre de pièces",
-        "dpe_classe": "DPE",
-    }
-    manquants_importants = [
-        label for champ, label in champs_prioritaires.items()
-        if fiche.get(champ) is None
-    ]
-    if manquants_importants and remplis > 0:
-        reponse += "\n\n💡 _Il me manque encore : " + ", ".join(manquants_importants) + "_"
+    manquants = champs_manquants_obligatoires(fiche)
+    if manquants:
+        premier = manquants[0]
+        reponse += "\n\n❗ Il me manque encore des champs obligatoires."
+        reponse += f"\n👉 {question_pour_champ(premier)}"
+    else:
+        secondaires = champs_manquants_secondaires(fiche)
+        if secondaires:
+            labels = [LIBELLES.get(c, c) for c in secondaires[:5]]
+            reponse += "\n\n✨ Obligatoires complets."
+            reponse += "\nIl me manque encore quelques champs secondaires : " + ", ".join(labels)
+            if len(secondaires) > 5:
+                reponse += "..."
+        else:
+            reponse += "\n\n🎉 Tout est rempli."
 
     return reponse
 
 
-# --- Génération du PDF ---
+# --- PDF ---
 
 def generer_pdf(fiche: dict) -> str:
-    """Génère un PDF propre de la fiche de bien et retourne le chemin du fichier"""
-
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_auto_page_break(auto=True, margin=15)
 
-    # --- En-tête ---
-    pdf.set_fill_color(41, 65, 122)  # Bleu foncé
-    pdf.rect(0, 0, 210, 40, "F")
+    pdf.set_fill_color(41, 65, 122)
+    pdf.rect(0, 0, 210, 35, "F")
 
-    pdf.set_font("Helvetica", "B", 22)
     pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 20)
     pdf.set_y(8)
-    pdf.cell(0, 12, "FICHE DE BIEN IMMOBILIER", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.cell(0, 10, "FICHE BIEN IMMOBILIER", align="C", ln=1)
 
-    # Sous-titre avec type + ville
-    sous_titre = ""
-    if fiche.get("type_bien"):
-        sous_titre += str(fiche["type_bien"])
+    sous_titre = fiche.get("type_bien") or "Bien"
     if fiche.get("ville"):
-        sous_titre += f" - {fiche['ville']}"
+        sous_titre += f" - {fiche.get('ville')}"
     if fiche.get("prix"):
-        sous_titre += f" - {fiche['prix']} EUR"
+        sous_titre += f" - {fiche.get('prix')} EUR"
 
-    if sous_titre:
-        pdf.set_font("Helvetica", "", 13)
-        pdf.cell(0, 10, sous_titre, new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 8, sous_titre, align="C", ln=1)
 
-    pdf.set_y(45)
+    pdf.ln(12)
 
-    # --- Fonctions d'aide ---
-    def titre_section(nom):
-        pdf.set_font("Helvetica", "B", 13)
-        pdf.set_text_color(41, 65, 122)
+    def titre_section(titre):
         pdf.set_fill_color(230, 236, 245)
-        pdf.cell(0, 9, f"  {nom}", new_x="LMARGIN", new_y="NEXT", align="L", fill=True)
-        pdf.ln(2)
+        pdf.set_text_color(41, 65, 122)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, f"  {titre}", ln=1, fill=True)
+        pdf.ln(1)
 
-    def ligne_info(label, valeur):
-        if valeur is None:
+    def ligne(label, valeur):
+        if valeur is None or valeur == "":
             return
-        pdf.set_font("Helvetica", "B", 10)
         pdf.set_text_color(80, 80, 80)
-        pdf.cell(70, 7, f"  {label}", new_x="RIGHT", new_y="TOP")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(30, 30, 30)
-        pdf.cell(0, 7, str(valeur), new_x="LMARGIN", new_y="NEXT")
-
-    def ligne_oui_non(label, valeur):
-        if valeur is None:
-            return
-        val_str = str(valeur)
-        symbole = "OUI" if val_str.lower() in ["oui", "true", "yes", "1"] else "NON"
         pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(80, 80, 80)
-        pdf.cell(70, 7, f"  {label}", new_x="RIGHT", new_y="TOP")
-        pdf.set_font("Helvetica", "", 10)
-        if symbole == "OUI":
-            pdf.set_text_color(39, 137, 68)
-        else:
-            pdf.set_text_color(180, 60, 60)
-        pdf.cell(0, 7, symbole, new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(65, 7, label)
         pdf.set_text_color(30, 30, 30)
-
-    def bloc_texte(label, valeur):
-        if valeur is None:
-            return
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(80, 80, 80)
-        pdf.cell(0, 7, f"  {label} :", new_x="LMARGIN", new_y="NEXT")
         pdf.set_font("Helvetica", "", 10)
-        pdf.set_text_color(30, 30, 30)
-        pdf.set_x(20)
-        pdf.multi_cell(170, 6, str(valeur))
-        pdf.ln(2)
+        pdf.multi_cell(0, 7, str(valeur))
 
-    # --- Informations Générales ---
-    titre_section("INFORMATIONS GENERALES")
-    ligne_info("Type de bien", fiche.get("type_bien"))
-    ligne_info("Transaction", fiche.get("type_transaction"))
-    ligne_info("Prix", f"{fiche['prix']} EUR" if fiche.get("prix") else None)
-    ligne_info("Adresse", fiche.get("adresse"))
-    ligne_info("Code postal", fiche.get("code_postal"))
-    ligne_info("Ville", fiche.get("ville"))
-    ligne_info("Etage", fiche.get("etage"))
-    ligne_info("Etages immeuble", fiche.get("nombre_etages_immeuble"))
+    titre_section("OBLIGATOIRES")
+    for champ in champs_obligatoires_actifs(fiche):
+        ligne(LIBELLES.get(champ, champ), formater_valeur_pdf(champ, fiche.get(champ)))
+
     pdf.ln(3)
+    titre_section("SECONDAIRES")
+    for champ in champs_secondaires():
+        if champ == "surface_balcon" and est_non(fiche.get("balcon")):
+            continue
+        if champ == "surface_terrasse" and est_non(fiche.get("terrasse")):
+            continue
+        if champ == "surface_jardin" and est_non(fiche.get("jardin")):
+            continue
+        if champ == "nom_syndic" and est_non(fiche.get("copropriete")):
+            continue
 
-    # --- Surfaces ---
-    titre_section("SURFACES")
-    ligne_info("Surface habitable", f"{fiche['surface_habitable']} m2" if fiche.get("surface_habitable") else None)
-    ligne_info("Surface terrain", f"{fiche['surface_terrain']} m2" if fiche.get("surface_terrain") else None)
-    ligne_info("Surface sejour", f"{fiche['surface_sejour']} m2" if fiche.get("surface_sejour") else None)
-    ligne_info("Surface cuisine", f"{fiche['surface_cuisine']} m2" if fiche.get("surface_cuisine") else None)
-    pdf.ln(3)
+        ligne(LIBELLES.get(champ, champ), formater_valeur_pdf(champ, fiche.get(champ)))
 
-    # --- Pièces ---
-    titre_section("PIECES")
-    ligne_info("Nombre de pieces", fiche.get("nombre_pieces"))
-    ligne_info("Chambres", fiche.get("nombre_chambres"))
-    ligne_info("Salles de bain", fiche.get("nombre_sdb"))
-    ligne_info("WC", fiche.get("nombre_wc"))
-    pdf.ln(3)
-
-    # --- Caractéristiques ---
-    titre_section("CARACTERISTIQUES")
-    ligne_oui_non("Balcon", fiche.get("balcon"))
-    ligne_oui_non("Terrasse", fiche.get("terrasse"))
-    ligne_oui_non("Jardin", fiche.get("jardin"))
-    ligne_oui_non("Cave", fiche.get("cave"))
-    ligne_oui_non("Parking", fiche.get("parking"))
-    ligne_oui_non("Garage", fiche.get("garage"))
-    ligne_oui_non("Piscine", fiche.get("piscine"))
-    ligne_oui_non("Ascenseur", fiche.get("ascenseur"))
-    ligne_oui_non("Digicode", fiche.get("digicode"))
-    ligne_oui_non("Interphone", fiche.get("interphone"))
-    pdf.ln(3)
-
-    # --- État et Énergie ---
-    titre_section("ETAT ET ENERGIE")
-    ligne_info("Etat general", fiche.get("etat_general"))
-    ligne_info("Annee de construction", fiche.get("annee_construction"))
-    ligne_info("DPE Classe", fiche.get("dpe_classe"))
-    ligne_info("DPE Valeur", fiche.get("dpe_valeur"))
-    ligne_info("GES Classe", fiche.get("ges_classe"))
-    ligne_info("GES Valeur", fiche.get("ges_valeur"))
-    ligne_info("Type de chauffage", fiche.get("type_chauffage"))
-    ligne_info("Energie chauffage", fiche.get("energie_chauffage"))
-    pdf.ln(3)
-
-    # --- Charges et Copropriété ---
-    titre_section("CHARGES ET COPROPRIETE")
-    ligne_info("Charges copro/mois", f"{fiche['charges_copro_mois']} EUR" if fiche.get("charges_copro_mois") else None)
-    ligne_info("Taxe fonciere/an", f"{fiche['taxe_fonciere_an']} EUR" if fiche.get("taxe_fonciere_an") else None)
-    ligne_info("Nombre de lots", fiche.get("nombre_lots_copro"))
-    ligne_info("Syndic", fiche.get("syndic"))
-    pdf.ln(3)
-
-    # --- Propriétaire ---
-    titre_section("PROPRIETAIRE")
-    ligne_info("Nom", fiche.get("nom_proprietaire"))
-    ligne_info("Telephone", fiche.get("tel_proprietaire"))
-    ligne_info("Email", fiche.get("email_proprietaire"))
-    pdf.ln(3)
-
-    # --- Notes ---
-    titre_section("NOTES ET OBSERVATIONS")
-    bloc_texte("Points forts", fiche.get("points_forts"))
-    bloc_texte("Points faibles", fiche.get("points_faibles"))
-    bloc_texte("Notes agent", fiche.get("notes_agent"))
-
-    # --- Pied de page ---
-    pdf.ln(10)
+    pdf.ln(8)
     pdf.set_font("Helvetica", "I", 8)
-    pdf.set_text_color(150, 150, 150)
-    date_str = datetime.now().strftime("%d/%m/%Y a %Hh%M")
-    pdf.cell(0, 5, f"Fiche generee automatiquement par ImmoAssist le {date_str}", align="C")
+    pdf.set_text_color(140, 140, 140)
+    date_str = datetime.now().strftime("%d/%m/%Y à %Hh%M")
+    pdf.cell(0, 5, f"Fiche générée automatiquement le {date_str}", align="C")
 
-    # Sauvegarder
     tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
     pdf.output(tmp.name)
     return tmp.name
 
 
-# --- Commandes du bot ---
+# --- Commandes ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+    conversations[user_id] = nouvelle_fiche()
 
     await update.message.reply_text(
         "👋 Salut ! Je suis ton assistant immobilier.\n\n"
-        "Envoie-moi les infos du bien que tu visites, comme si tu parlais à un collègue.\n\n"
-        "Tu peux m'envoyer :\n"
-        "💬 Des messages écrits\n"
-        "🎤 Des notes vocales\n\n"
-        "Par exemple :\n"
-        "« C'est un T3 de 65m² au 2ème étage, rue de la Paix à Lyon. "
-        "Prix vendeur 280k. Bon état, DPE D. "
-        "Balcon, cave. Charges 150€/mois. »\n\n"
-        "🧠 Je comprends ce que tu dis et je remplis la fiche automatiquement !\n\n"
-        "📋 /fiche → voir la fiche en cours\n"
-        "❓ /manque → voir les champs à remplir\n"
-        "📄 /export → générer le PDF de la fiche\n"
-        "🗑️ /reset → recommencer une nouvelle fiche"
+        "Tu peux m’envoyer :\n"
+        "💬 du texte\n"
+        "🎤 des notes vocales\n\n"
+        "Je remplis automatiquement la fiche du bien.\n\n"
+        "Exemple :\n"
+        "« Appartement avenue Victor Hugo à Paris 16, 4e étage avec ascenseur, "
+        "145 m², 6 pièces, 3 chambres, bon état, parties communes en excellent état, "
+        "2 salles de bains, 1 salle d’eau, 2 WC, chauffage collectif, DPE D. "
+        "Points forts : vue, lumière, plan. Points faibles : cuisine à refaire. »\n\n"
+        "Commandes :\n"
+        "📋 /fiche → voir la fiche\n"
+        "❓ /manque → voir ce qu’il manque\n"
+        "📄 /export → générer le PDF\n"
+        "🗑️ /reset → recommencer"
     )
 
 
 async def voir_fiche(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    fiche = conversations.get(user_id, {})
+    fiche = conversations.get(user_id, nouvelle_fiche())
 
-    if not fiche or all(v is None for v in fiche.values()):
-        await update.message.reply_text(
-            "📋 La fiche est vide pour l'instant.\n"
-            "Envoie-moi des infos sur le bien !"
-        )
+    if all(v in [None, ""] for v in fiche.values()):
+        await update.message.reply_text("📋 La fiche est vide pour l’instant.")
         return
 
-    lignes = ["📋 *FICHE DU BIEN EN COURS*\n"]
-    remplis = 0
-    total = len(fiche)
+    lignes = ["📋 *FICHE EN COURS*\n"]
 
-    categories = {
-        "🏠 Général": ["type_bien", "type_transaction", "prix", "adresse", "code_postal", "ville", "etage", "nombre_etages_immeuble"],
-        "📐 Surfaces": ["surface_habitable", "surface_terrain", "surface_sejour", "surface_cuisine"],
-        "🚪 Pièces": ["nombre_pieces", "nombre_chambres", "nombre_sdb", "nombre_wc"],
-        "✨ Caractéristiques": ["balcon", "terrasse", "jardin", "cave", "parking", "garage", "piscine", "ascenseur", "digicode", "interphone"],
-        "🔧 État & Énergie": ["etat_general", "annee_construction", "dpe_classe", "dpe_valeur", "ges_classe", "ges_valeur", "type_chauffage", "energie_chauffage"],
-        "💰 Charges": ["charges_copro_mois", "taxe_fonciere_an", "nombre_lots_copro", "syndic"],
-        "👤 Propriétaire": ["nom_proprietaire", "tel_proprietaire", "email_proprietaire"],
-        "📝 Notes": ["points_forts", "points_faibles", "notes_agent"],
-    }
+    obligatoires = champs_obligatoires_actifs(fiche)
+    remplis_obligatoires = sum(1 for c in obligatoires if fiche.get(c) not in [None, ""])
+    lignes.append(f"Obligatoires : {remplis_obligatoires}/{len(obligatoires)}\n")
 
-    for cat_nom, champs in categories.items():
-        cat_lignes = []
-        for champ in champs:
-            val = fiche.get(champ)
-            if val is not None:
-                label = champ.replace("_", " ").capitalize()
-                cat_lignes.append(f"  ✅ {label}: {val}")
-                remplis += 1
-        if cat_lignes:
-            lignes.append(f"\n{cat_nom}")
-            lignes.extend(cat_lignes)
+    lignes.append("🏠 *Champs obligatoires*")
+    for champ in obligatoires:
+        valeur = fiche.get(champ)
+        etat = "✅" if valeur not in [None, ""] else "⬜"
+        lignes.append(f"{etat} {LIBELLES.get(champ, champ)} : {valeur if valeur not in [None, ''] else '—'}")
 
-    lignes.insert(1, f"Progression: {remplis}/{total} champs remplis\n")
+    lignes.append("\n✨ *Champs secondaires*")
+    for champ in champs_secondaires():
+        if champ == "surface_balcon" and est_non(fiche.get("balcon")):
+            continue
+        if champ == "surface_terrasse" and est_non(fiche.get("terrasse")):
+            continue
+        if champ == "surface_jardin" and est_non(fiche.get("jardin")):
+            continue
+        if champ == "nom_syndic" and est_non(fiche.get("copropriete")):
+            continue
+
+        valeur = fiche.get(champ)
+        if valeur not in [None, ""]:
+            lignes.append(f"✅ {LIBELLES.get(champ, champ)} : {valeur}")
 
     await update.message.reply_text("\n".join(lignes), parse_mode="Markdown")
 
 
 async def voir_manque(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    fiche = conversations.get(user_id, {})
+    fiche = conversations.get(user_id, nouvelle_fiche())
 
-    manquants = [
-        champ.replace("_", " ").capitalize()
-        for champ, val in fiche.items()
-        if val is None
-    ]
+    manquants_obligatoires = champs_manquants_obligatoires(fiche)
+    manquants_secondaires = champs_manquants_secondaires(fiche)
 
-    if not manquants:
-        await update.message.reply_text("🎉 Bravo ! Tous les champs sont remplis !")
+    if not manquants_obligatoires and not manquants_secondaires:
+        await update.message.reply_text("🎉 Tout est rempli.")
+        return
+
+    txt = "❓ *Champs manquants*\n\n"
+
+    if manquants_obligatoires:
+        txt += "*Obligatoires :*\n"
+        txt += "\n".join(f"• {LIBELLES.get(c, c)}" for c in manquants_obligatoires)
+        txt += "\n\n"
+        txt += f"👉 Question suivante : {question_pour_champ(manquants_obligatoires[0])}\n\n"
     else:
-        txt = "❓ *Champs encore vides :*\n\n"
-        txt += "\n".join(f"  • {m}" for m in manquants)
-        txt += f"\n\n_({len(manquants)} champs restants)_"
-        await update.message.reply_text(txt, parse_mode="Markdown")
+        txt += "✅ Tous les champs obligatoires sont remplis.\n\n"
+
+    if manquants_secondaires:
+        txt += "*Secondaires :*\n"
+        txt += "\n".join(f"• {LIBELLES.get(c, c)}" for c in manquants_secondaires[:15])
+        if len(manquants_secondaires) > 15:
+            txt += f"\n… et {len(manquants_secondaires) - 15} autres"
+
+    await update.message.reply_text(txt, parse_mode="Markdown")
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
-    await update.message.reply_text(
-        "🗑️ Fiche remise à zéro !\n"
-        "Tu peux commencer à me décrire un nouveau bien."
-    )
+    conversations[user_id] = nouvelle_fiche()
+    await update.message.reply_text("🗑️ Fiche remise à zéro.")
 
 
 async def export_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Génère et envoie le PDF de la fiche"""
     user_id = update.effective_user.id
-    fiche = conversations.get(user_id, {})
+    fiche = conversations.get(user_id, nouvelle_fiche())
 
-    if not fiche or all(v is None for v in fiche.values()):
-        await update.message.reply_text(
-            "📋 La fiche est vide ! Envoie-moi d'abord des infos sur le bien."
-        )
+    if all(v in [None, ""] for v in fiche.values()):
+        await update.message.reply_text("📋 La fiche est vide.")
         return
 
     processing_msg = await update.message.reply_text("📄 Je génère le PDF...")
 
     try:
-        # Générer le PDF
         pdf_path = generer_pdf(fiche)
 
-        # Construire le nom du fichier
-        nom_fichier = "Fiche"
+        nom_fichier = "Fiche_Bien"
         if fiche.get("type_bien"):
             nom_fichier += f"_{fiche['type_bien']}"
         if fiche.get("ville"):
             nom_fichier += f"_{fiche['ville']}"
-        nom_fichier += f"_{datetime.now().strftime('%d%m%Y')}.pdf"
+        nom_fichier += "_" + datetime.now().strftime("%d%m%Y") + ".pdf"
         nom_fichier = nom_fichier.replace(" ", "_")
 
-        # Envoyer le PDF
         with open(pdf_path, "rb") as pdf_file:
             await update.message.reply_document(
                 document=pdf_file,
                 filename=nom_fichier,
-                caption="📄 Voici ta fiche de bien ! Tu peux l'imprimer ou l'envoyer directement."
+                caption="📄 Voici la fiche du bien."
             )
 
-        # Supprimer le fichier temporaire
         os.unlink(pdf_path)
-
-        # Supprimer le message "en cours"
         await processing_msg.delete()
-
-        remplis = sum(1 for v in fiche.values() if v is not None)
-        total = len(fiche)
-        logger.info(f"PDF généré: {nom_fichier} ({remplis}/{total} champs)")
 
     except Exception as e:
         logger.error(f"Erreur génération PDF: {e}")
-        await processing_msg.edit_text(
-            f"❌ Erreur lors de la génération du PDF.\nDétail : {e}"
-        )
+        await processing_msg.edit_text(f"❌ Erreur lors de la génération du PDF : {e}")
 
+
+# --- Messages ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reçoit tous les messages texte et les analyse avec l'IA"""
     user_id = update.effective_user.id
     texte = update.message.text
 
-    processing_msg = await update.message.reply_text("🧠 J'analyse ton message...")
+    processing_msg = await update.message.reply_text("🧠 J’analyse ton message...")
     reponse = await traiter_texte(user_id, texte)
     await processing_msg.edit_text(reponse, parse_mode="Markdown")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reçoit les notes vocales, les transcrit, puis les analyse"""
     user_id = update.effective_user.id
 
     if user_id not in conversations:
-        conversations[user_id] = json.loads(json.dumps(CHAMPS_BIEN))
+        conversations[user_id] = nouvelle_fiche()
 
     processing_msg = await update.message.reply_text("🎤 Je transcris ta note vocale...")
 
@@ -604,39 +894,36 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         await processing_msg.edit_text(
-            f"🎤 Transcription : « {texte} »\n\n🧠 J'analyse les infos..."
+            f"🎤 Transcription : « {texte} »\n\n🧠 J’analyse les infos..."
         )
 
         reponse = await traiter_texte(user_id, texte)
 
-        duree = voice.duration
         message_final = (
-            f"🎤 *Note vocale* ({duree}s) :\n"
+            f"🎤 *Note vocale* ({voice.duration}s)\n"
             f"« {texte} »\n\n"
             f"{reponse}"
         )
         await processing_msg.edit_text(message_final, parse_mode="Markdown")
 
-        logger.info(f"Vocal traité ({duree}s): {texte[:100]}")
-
     except Exception as e:
         logger.error(f"Erreur traitement vocal: {e}")
         await processing_msg.edit_text(
-            f"❌ Erreur lors du traitement de la note vocale.\nDétail : {e}"
+            f"❌ Erreur lors du traitement de la note vocale : {e}"
         )
 
 
-# --- Démarrage du bot ---
+# --- Main ---
 
 def main():
     if not TOKEN:
-        print("❌ ERREUR: La variable TELEGRAM_BOT_TOKEN n'est pas définie !")
+        print("❌ ERREUR : TELEGRAM_BOT_TOKEN n'est pas défini.")
         return
 
     if not OPENAI_KEY:
-        print("⚠️ ATTENTION: La variable OPENAI_API_KEY n'est pas définie !")
+        print("⚠️ ATTENTION : OPENAI_API_KEY n'est pas défini.")
 
-    print("🚀 Démarrage du bot avec IA + PDF...")
+    print("🚀 Démarrage du bot immobilier...")
 
     app = Application.builder().token(TOKEN).build()
 
@@ -645,10 +932,11 @@ def main():
     app.add_handler(CommandHandler("manque", voir_manque))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("export", export_pdf))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
 
-    print("✅ Bot prêt ! IA + PDF actifs, en attente de messages...")
+    print("✅ Bot prêt.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
